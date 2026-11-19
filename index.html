@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Badminton Manager — v4.9 (Master)</title>
+<title>Badminton Manager — v5.0 (Master)</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
 /* ===== THEME (Red / White / Deep Blue) ===== */
@@ -93,7 +93,7 @@ main > section { min-width: 0; }
 <header class="bg-gradient-to-r from-red-700 via-white to-blue-900">
   <div class="max-w-7xl mx-auto px-4 py-4 flex flex-wrap items-center gap-3 justify-between">
     <h1 class="text-xl sm:text-2xl font-extrabold tracking-tight drop-shadow-[0_1px_1px_rgba(0,0,0,.35)]">
-      Badminton Manager <span class="opacity-90 text-sm font-medium">v4.9 Master</span>
+      Badminton Manager <span class="opacity-90 text-sm font-medium">v5.0 Master</span>
     </h1>
     <div class="flex flex-wrap gap-2">
       <button id="btnAuto" class="btn">⚡ จัดอัตโนมัติ (ทุกสนาม)</button>
@@ -433,6 +433,9 @@ main > section { min-width: 0; }
   </div>
 </dialog>
 
+<div id="saveWarning" hidden class="fixed top-0 inset-x-0 z-50 bg-red-700 text-white text-sm text-center px-4 py-2 shadow-lg">
+  ⚠️ บันทึกข้อมูลลงเครื่องไม่ได้ (พื้นที่เต็มหรือเบราว์เซอร์บล็อก) — กด <b>⬇️ สำรองข้อมูลเป็นไฟล์</b> ในโหมด Admin เก็บไว้ก่อน ข้อมูลอาจหายเมื่อปิดหน้านี้
+</div>
 <div id="toast-container" class="fixed bottom-4 right-4 z-50 flex flex-col items-end gap-2"></div>
 
 <script>
@@ -537,32 +540,122 @@ function mkPlayer(name, rank){
   return { id:uid(), name, rank, originalRank: rank, active:true, lastPlayedAt:0, timesPlayedToday:0, baseGames:0, pinned:false, enqueuedAt:now(), cooldown:0 };
 }
 
+function mkCourts(n){ const a=[]; for(let i=1;i<=n;i++) a.push({id:uid(),label:`สนาม ${i}`,match:null}); return a; }
+
+// บันทึกลงเครื่อง — ถ้าบันทึกไม่ได้ (พื้นที่เต็ม / เบราว์เซอร์บล็อก) จะขึ้นแถบเตือนค้างไว้ ไม่ล่มเงียบ
+let saveFailed=false;
+function save(){
+  try{
+    localStorage.setItem(STORE_KEY, JSON.stringify(S));
+    if(saveFailed){ saveFailed=false; const b=document.getElementById('saveWarning'); if(b) b.hidden=true; }
+  }catch(e){
+    if(!saveFailed){ saveFailed=true; const b=document.getElementById('saveWarning'); if(b) b.hidden=false; }
+  }
+}
+
+const RANKS = ['BG','N','M','H','S','F'];
+const CONSTRAINT_TYPES = ['FORBIDDEN_TOGETHER','OPPONENTS_ONLY','TEAMMATES_ALWAYS'];
+const clampNum = (v,min,max,def)=>{ const n=Number(v); return Number.isFinite(n) ? Math.min(max,Math.max(min,n)) : def; };
+
+// ตรวจและซ่อมข้อมูลทั้งก้อน (ใช้ทั้งตอนโหลดจากเครื่องและตอนกู้คืนไฟล์) — คืนสำเนาใหม่ ไม่แก้ของเดิม
+// โยน Error เฉพาะเมื่อไม่ใช่ข้อมูลของโปรแกรมนี้เลย; ส่วนแถวที่เสียจะถูกตัดทิ้ง
+function normalizeState(raw){
+  if(!raw || typeof raw!=='object' || !Array.isArray(raw.players) || !Array.isArray(raw.history))
+    throw new Error('ไม่ใช่ไฟล์ข้อมูลของโปรแกรมนี้');
+  const isId = v => typeof v==='string' && v.length>0;
+  const idList = arr => Array.isArray(arr) ? arr.filter(isId) : null;
+
+  const st = raw.settings && typeof raw.settings==='object' ? raw.settings : {};
+  const settings = {...DEFAULT.settings, ...st};
+  settings.COURTS = Math.round(clampNum(settings.COURTS,1,8,DEFAULT.settings.COURTS));
+  settings.MATCH_MINUTES = clampNum(settings.MATCH_MINUTES,5,60,DEFAULT.settings.MATCH_MINUTES);
+  settings.MAX_SKILL_DIFF = clampNum(settings.MAX_SKILL_DIFF,0,10,DEFAULT.settings.MAX_SKILL_DIFF);
+  settings.COOLDOWN_ROUNDS = Math.round(clampNum(settings.COOLDOWN_ROUNDS,1,10,DEFAULT.settings.COOLDOWN_ROUNDS));
+  settings.MENTOR_GAP = Math.round(clampNum(settings.MENTOR_GAP,1,10,DEFAULT.settings.MENTOR_GAP));
+  settings.allowForceAssign = !!settings.allowForceAssign;
+  settings.adminMode = !!settings.adminMode;
+  const w = st.SKILL_WEIGHTS && typeof st.SKILL_WEIGHTS==='object' ? st.SKILL_WEIGHTS : {};
+  settings.SKILL_WEIGHTS = {};
+  for(const k of ['BG','N','M','H','S']) settings.SKILL_WEIGHTS[k]=clampNum(w[k],1,10,DEFAULT.settings.SKILL_WEIGHTS[k]);
+
+  const seen=new Set(), players=[];
+  for(const p of raw.players){
+    if(!p || !isId(p.id) || seen.has(p.id) || typeof p.name!=='string' || !p.name.trim()) continue;
+    seen.add(p.id);
+    const orig = RANKS.includes(p.originalRank) ? p.originalRank : (RANKS.includes(p.rank) ? p.rank : 'M');
+    players.push({
+      id:p.id, name:p.name.trim(), rank:orig, originalRank:orig,
+      active:p.active!==false, pinned:!!p.pinned,
+      baseGames:Math.max(0,Math.round(clampNum(p.baseGames,0,999,0))),
+      timesPlayedToday:0,
+      cooldown:Math.max(0,Math.round(clampNum(p.cooldown,0,99,0))),
+      enqueuedAt:clampNum(p.enqueuedAt,0,Number.MAX_SAFE_INTEGER,now()),
+      lastPlayedAt:clampNum(p.lastPlayedAt,0,Number.MAX_SAFE_INTEGER,0)
+    });
+  }
+
+  // keepSlots: เกมที่กำลังเล่นในสนามอาจมีช่องว่าง (null) จากการนำคนออก — ต้องคงตำแหน่งช่องไว้
+  const cleanGame = (g, keepSlots=false) => {
+    if(!g || typeof g!=='object') return null;
+    const slots = arr => Array.isArray(arr) ? arr.map(v=>isId(v)?v:null) : null;
+    const teamA = keepSlots ? slots(g.teamA) : idList(g.teamA);
+    const teamB = keepSlots ? slots(g.teamB) : idList(g.teamB);
+    if(!teamA || !teamB || [...teamA,...teamB].filter(Boolean).length===0) return null;
+    const out={...g, teamA, teamB,
+      startedAt:clampNum(g.startedAt,0,Number.MAX_SAFE_INTEGER,0),
+      id:isId(g.id)?g.id:uid() };
+    if(g.endedAt!=null) out.endedAt=clampNum(g.endedAt,0,Number.MAX_SAFE_INTEGER,out.startedAt);
+    out.namesA=Array.isArray(g.namesA)?g.namesA.map(String):undefined;
+    out.namesB=Array.isArray(g.namesB)?g.namesB.map(String):undefined;
+    out.cooldownDec=idList(g.cooldownDec)||[];
+    return out;
+  };
+  const history = raw.history.map(g=>cleanGame(g)).filter(Boolean);
+
+  let courts = Array.isArray(raw.courts) ? raw.courts.filter(c=>c && isId(c.id)).map(c=>({
+    id:c.id, label:(typeof c.label==='string'&&c.label.trim())?c.label:'สนาม', match:cleanGame(c.match,true)
+  })) : [];
+  if(!courts.length) courts = mkCourts(settings.COURTS);
+
+  const constraints = Array.isArray(raw.constraints) ? raw.constraints.filter(r=>
+    r && isId(r.a) && isId(r.b) && r.a!==r.b && CONSTRAINT_TYPES.includes(r.type)
+  ).map(r=>({id:isId(r.id)?r.id:uid(), a:r.a, b:r.b, type:r.type})) : [];
+
+  const pair2 = t => { const l=idList(t); return l && l.length===2 ? l : null; };
+  let reserved=null;
+  if(raw.reserved){ const a=pair2(raw.reserved.teamA), b=pair2(raw.reserved.teamB); if(a&&b) reserved={teamA:a,teamB:b}; }
+
+  let training=null;
+  const t=raw.training;
+  if(t && pair2(t.team) && Array.isArray(t.pairs)){
+    const pairs=t.pairs.filter(pr=>pr&&isId(pr.a)&&isId(pr.b)).map(pr=>({a:pr.a,b:pr.b,used:Math.max(0,Math.round(clampNum(pr.used,0,999,0)))}));
+    const total=Math.round(clampNum(t.total,1,30,6));
+    if(pairs.length) training={team:pair2(t.team), pairs, total, done:Math.max(0,Math.round(clampNum(t.done,0,total,0)))};
+  }
+
+  return { settings, players, constraints, reserved, training, courts, history };
+}
+
+// โหลดจากเครื่อง — ถ้าอ่านไม่ได้ เก็บข้อมูลดิบไว้คีย์สำรองก่อน (ไม่ลบทิ้ง) แล้วเริ่มใหม่
+function load(){
+  const s=localStorage.getItem(STORE_KEY);
+  if(!s) return null;
+  try{ return normalizeState(JSON.parse(s)); }
+  catch(e){
+    try{ localStorage.setItem(`${STORE_KEY}_corrupt_${Date.now()}`, s); }catch(_){}
+    setTimeout(()=>toast('⚠️ ข้อมูลในเครื่องเสีย อ่านไม่ได้ — เก็บสำเนาไว้แล้ว และเริ่มข้อมูลใหม่ให้',6000),300);
+    return null;
+  }
+}
+
+// ต้องประกาศหลัง normalizeState/RANKS/clampNum เสมอ (const อยู่ใน TDZ จนกว่าจะถึงบรรทัดที่ประกาศ)
 let S = load() || (()=>{
   const s = structuredClone(DEFAULT);
   s.players = seedPlayers();
   s.courts = mkCourts(s.settings.COURTS);
   return s;
 })();
-
-function mkCourts(n){ const a=[]; for(let i=1;i<=n;i++) a.push({id:uid(),label:`สนาม ${i}`,match:null}); return a; }
-function save(){ localStorage.setItem(STORE_KEY, JSON.stringify(S)); }
-// merge กับ DEFAULT เสมอ — กันข้อมูลเก่าที่ไม่มี setting ใหม่กลายเป็น undefined
-function load(){
-  try{
-    const s=localStorage.getItem(STORE_KEY);
-    if(!s) return null;
-    const data=JSON.parse(s);
-    data.settings={...DEFAULT.settings,...(data.settings||{})};
-    data.settings.SKILL_WEIGHTS={...DEFAULT.settings.SKILL_WEIGHTS,...(data.settings.SKILL_WEIGHTS||{})};
-    data.players=data.players||[];
-    data.constraints=data.constraints||[];
-    data.reserved=data.reserved||null;
-    data.training=data.training||null;
-    data.courts=data.courts||[];
-    data.history=data.history||[];
-    return data;
-  }catch(e){return null}
-}
+pruneOrphans(); // ตัดกฎ/คิวจอง/แผนซ้อม ที่อ้างถึงผู้เล่นที่ถูกตัดทิ้งตอนซ่อมข้อมูล
 function clearAll(){ localStorage.removeItem(STORE_KEY); location.reload(); }
 
 function rebuildMatrices() {
@@ -594,9 +687,11 @@ function recalculateGames() {
   // ระบบสลับชั้นอัตโนมัติของมือ F (H/M) ทุกๆ 3 เกม — สลับเฉพาะตัวเอง ไม่กระทบผู้เล่นอื่น
   S.players.forEach(p => { p.rank = p.originalRank; });
 
+  // นับจากเกมที่เล่นจริง (ไม่รวมแต้มต่อคนมาสาย) — มือ F ที่มาสายจะเริ่มเฟส H เหมือนคนมาตรงเวลา
   S.players.forEach(p => {
     if (p.originalRank === 'F') {
-      const cycle = Math.floor(p.timesPlayedToday / 3);
+      const played = p.timesPlayedToday - (p.baseGames || 0);
+      const cycle = Math.floor(played / 3);
       p.rank = (cycle % 2 === 0) ? 'H' : 'M';
     }
   });
@@ -618,6 +713,8 @@ function matchElapsed(c){
   return { text:`${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`, over:diff>=target };
 }
 function getCourtLabelById(id){ const c=S.courts.find(x=>x.id===id); return c?c.label:'สนาม'; }
+// ชื่อสนามของเกมในประวัติ: ถ้าสนามยังอยู่ใช้ชื่อปัจจุบัน ถ้าถูกปิดไปแล้วใช้ชื่อที่จำไว้ตอนจบเกม
+function historyCourtLabel(g){ const c=S.courts.find(x=>x.id===g.court); return c?c.label:(g.courtLabel||'สนาม'); }
 
 // ชื่อที่บันทึกไว้ในประวัติตอนจบเกม — ใช้ต่อได้แม้ผู้เล่นคนนั้นถูกลบออกจากรายชื่อไปแล้ว
 const nameSnapshot = new Map();
@@ -630,7 +727,24 @@ function rebuildNameSnapshots(){
 }
 function safeName(id){ return getPlayer(id)?.name || nameSnapshot.get(id) || '' }
 function teamRanksString(team){ return team.map(id=>getPlayer(id)?.rank||'?').sort().join('') }
-function copyToClipboard(text){ navigator.clipboard.writeText(text).then(()=>toast('คัดลอกแล้ว')); }
+// คัดลอกข้อความ — ใช้ Clipboard API ถ้าได้ (https/localhost) ไม่งั้นใช้ทางสำรอง execCommand
+// (เปิดผ่าน http ธรรมดา เช่น IP ในวง LAN navigator.clipboard จะไม่มีให้ใช้)
+function copyToClipboard(text){
+  const ok=()=>toast('คัดลอกแล้ว');
+  const fallback=()=>{
+    // ต้องวางไว้ใน dialog ที่เปิดอยู่ — ถ้าวางนอก dialog แบบ modal จะถูกล็อก เลือกข้อความไม่ได้
+    const host=document.querySelector('dialog[open]')||document.body;
+    const ta=document.createElement('textarea');
+    ta.value=text; ta.setAttribute('readonly','');
+    ta.style.cssText='position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;';
+    host.appendChild(ta); ta.focus(); ta.select();
+    let done=false; try{ done=document.execCommand('copy'); }catch(e){}
+    ta.remove();
+    if(done) ok(); else toast('❌ คัดลอกไม่สำเร็จ — กดค้างที่ข้อความแล้วคัดลอกเองได้', 4500);
+  };
+  if(navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(ok).catch(fallback);
+  else fallback();
+}
 const isLightRank = r => r==='BG'||r==='N';
 const isHeavyRank = r => r==='H'||r==='S';
 
@@ -719,12 +833,24 @@ function encounterDiversityScore(ids) {
   return total;
 }
 
-function recentEncounterCount(id1, id2, windowGames) {
-  const recent = S.history.slice(-windowGames);
-  return recent.filter(g => {
-    const all = [...(g.teamA||[]), ...(g.teamB||[])];
-    return all.includes(id1) && all.includes(id2);
-  }).length;
+// หน้าต่าง "ล่าสุด" ของตัวจัดคู่ หน่วยเป็นจำนวนเกมของทั้งก๊วน (1 รอบ ≈ จำนวนสนาม) จูนไว้กับ 3 สนาม
+// ผลจำลอง v5.0 (6 ลำดับผู้เล่น × 16 รอบ): ที่ 4 สนาม ถ้าขยาย noRepeat ตามจำนวนสนาม (4 เกม)
+// "เจอกันรอบติดกัน" ลดจาก 8.5 → 0.3 ครั้ง แต่ส่วนต่างจำนวนเกมแย่ลง (สูงสุด 2 → 3) และที่ 2 สนามไม่ได้อะไรเพิ่ม
+// → คงค่าเดิมไว้เพราะความยุติธรรมของจำนวนเกมสำคัญกว่า; ถ้าจะเปิดให้ขยายตามสนามแก้ที่ฟังก์ชันนี้จุดเดียว
+function recencyWindows(courts){
+  return { noRepeat: 3, enc: 6, played: 8 };
+}
+
+// นับว่าแต่ละคู่เจอกันกี่ครั้งใน win เกมล่าสุด — คำนวณครั้งเดียวต่อการค้นหา (เดิมวนซ้ำในลูปหลักนับแสนครั้ง)
+function recentPairCounts(win){
+  const m=new Map();
+  for(const g of S.history.slice(-win)){
+    const all=[...(g.teamA||[]),...(g.teamB||[])].filter(Boolean);
+    for(let x=0;x<all.length;x++) for(let y=x+1;y<all.length;y++){
+      const k=encounterMatrix.key(all[x],all[y]); m.set(k,(m.get(k)||0)+1);
+    }
+  }
+  return m;
 }
 
 // [Mentor Rotation] นับจำนวนเกมที่ผู้เล่นลงไป ตั้งแต่ครั้งล่าสุดที่มีพี่เลี้ยง (H/S) ร่วมทีม — 999 = ไม่เคยมีเลย
@@ -744,6 +870,32 @@ function gamesSinceHeavyPartner(pid){
 }
 
 /*** Main Matching Algorithm (v3.3 — Max-Mix 3-Layer Degrade) ***/
+// น้ำหนักคะแนนการจัดคู่ (คะแนนรวมยิ่งต่ำยิ่งดี; ค่าติดลบ = โบนัส) — ปรับจูนที่นี่ที่เดียว
+const SCORE = {
+  GAMES_AHEAD_2:        2000000, // เล่นเกินคนที่เล่นน้อยสุด ≥2 เกม (แทบตัดออก — ความยุติธรรมมาก่อน)
+  GAMES_AHEAD_1_STRICT:   25000, // เล่นเกิน 1 เกม เมื่อทุกคนเล่นครบ 3 เกมแล้ว
+  GAMES_AHEAD_1_EARLY:     2000, // เล่นเกิน 1 เกม ช่วงต้นก๊วน
+  JUST_PLAYED:            80000, // อยู่ในเกมที่เพิ่งจบล่าสุด
+  RECENT_PLAYED_SQ:        1500, // × (จำนวนเกมที่เล่นในหน้าต่างล่าสุด)²
+  NEVER_MET:              -8000, // × scale — คู่ที่ไม่เคยเจอกัน (โบนัส)
+  MET_ONCE:                5000, // × scale
+  MET_TWICE:              30000, // × scale
+  MET_MANY:              100000, // × scale × (จำนวนครั้ง − 1)
+  TEAMMATE_REPEAT_SQ:     15000, // × scale × (เคยจับทีมกัน)²
+  OPPONENT_REPEAT_SQ:      8000, // × scale × (เคยเป็นคู่แข่งกันรวม)²
+  RECENT_ENCOUNTER:       20000, // ต่อครั้งที่คู่นี้เจอกันในหน้าต่างล่าสุด
+  HEAVY_VS_N:             40000, // มือหนักอยู่ฝั่งตรงข้ามมือ N
+  MENTOR_BASE:           -30000, // N ที่ห่างพี่เลี้ยงมานานได้คู่มือหนัก (โบนัส)
+  MENTOR_PER_GAME:        -3000, // × จำนวนเกมที่ห่างพี่เลี้ยง (สูงสุด 10)
+  MENTOR_TOO_SOON:        45000, // N เพิ่งได้พี่เลี้ยงไป — ให้กลับไปเล่นเกมปกติก่อน
+  HN_VS_MM:              -15000, // รูปแบบ HN vs MM (โบนัส)
+  MN_BOTH_SIDES:         -25000, // ทั้งสองทีมเป็น M+N (โบนัส)
+  BALANCE_PER_POINT:          8, // × ผลต่างน้ำหนักทีม
+  QUEUE_ORDER:               30, // × ผลรวมลำดับใน pool (ตัวตัดสินเมื่อคะแนนเท่ากัน)
+  RELAXED_IMBALANCE:     500000, // ชั้น 2: ทีมไม่สมดุลยังจัดได้แต่โดนหนัก
+  DIVERSITY_CAP:             18  // ชั้น 0: กลุ่ม 4 คนที่เจอกันสะสมรวม ≥ ค่านี้ ข้าม
+};
+
 // flag: true เมื่อแมตช์ล่าสุดต้องผ่อนกฎ (เลี่ยงเจอซ้ำไม่ได้) เพื่อให้ขึ้นเตือน
 let lastAssignRelaxed = false;
 
@@ -763,6 +915,15 @@ function searchMatch(ids, relax, mustId=null){
   const nStarve = new Map();
   for (const id of ids) if (getPlayer(id)?.rank==='N') nStarve.set(id, gamesSinceHeavyPartner(id));
   const MENTOR_GAP = S.settings.MENTOR_GAP ?? 2; // N ต้องเล่นแบบปกติ (MN/NN) อย่างน้อยกี่เกม ก่อนถึงคิวพี่เลี้ยงรอบถัดไป
+
+  const WIN = recencyWindows(Math.max(1, S.courts.length));
+  const recentNoRepeat = recentPairCounts(WIN.noRepeat);                   // ห้ามเจอซ้ำ (ชั้น 0)
+  const recentEnc = recentPairCounts(WIN.enc);                             // โทษเจอซ้ำ
+  const recentPlayed = new Map();                                          // เล่นถี่
+  for (const g of S.history.slice(-WIN.played))
+    for (const id of [...(g.teamA||[]), ...(g.teamB||[])]) if (id) recentPlayed.set(id, (recentPlayed.get(id)||0) + 1);
+  const lastGame = S.history[S.history.length-1];
+  const justPlayed = new Set(lastGame ? [...(lastGame.teamA||[]), ...(lastGame.teamB||[])] : []);
 
   let best = null;
   let bestScore = Infinity;
@@ -787,13 +948,13 @@ function searchMatch(ids, relax, mustId=null){
     if (!validGroup) continue;
 
     // ชั้น 0: กลุ่มที่เจอกันสะสมมากเกินไป ข้าม
-    if (relax<1 && encounterDiversityScore(four) >= 18) continue;
+    if (relax<1 && encounterDiversityScore(four) >= SCORE.DIVERSITY_CAP) continue;
 
-    // [ข้อ 1] ชั้น 0: ห้ามคู่เดิมเจอกันภายใน 3 เกมล่าสุด — ยกเว้นคู่ TEAMMATES_ALWAYS
+    // [ข้อ 1] ชั้น 0: ห้ามคู่เดิมเจอกันภายใน ~1 รอบล่าสุด — ยกเว้นคู่ TEAMMATES_ALWAYS
     if (relax<1) {
       let recentRepeat = false;
       for (let x=0;x<4 && !recentRepeat;x++) for (let y=x+1;y<4;y++) {
-        if (!isAlwaysTeammates(four[x],four[y]) && recentEncounterCount(four[x],four[y],3)>0) { recentRepeat = true; break; }
+        if (!isAlwaysTeammates(four[x],four[y]) && (recentNoRepeat.get(encounterMatrix.key(four[x],four[y]))||0)>0) { recentRepeat = true; break; }
       }
       if (recentRepeat) continue;
     }
@@ -821,7 +982,7 @@ function searchMatch(ids, relax, mustId=null){
       // กฎผู้ใช้บังคับเสมอ
       if (!canFormUserConstraints(A, B)) continue;
       // กฎสมดุล skill: ชั้น 0–1 บังคับ, ชั้น 2 ผ่อนเป็นค่าปรับ
-      if (isForbiddenPairing(A, B)) { if (relax<2) continue; score += 500000; }
+      if (isForbiddenPairing(A, B)) { if (relax<2) continue; score += SCORE.RELAXED_IMBALANCE; }
 
       const allFour = [...A, ...B];
 
@@ -830,30 +991,27 @@ function searchMatch(ids, relax, mustId=null){
         const gameDiff = p.timesPlayedToday - minGames;
 
         if (gameDiff >= 2) {
-          score += 2000000;
+          score += SCORE.GAMES_AHEAD_2;
         } else if (gameDiff === 1) {
-          score += isStrictPhase ? 25000 : 2000;
+          score += isStrictPhase ? SCORE.GAMES_AHEAD_1_STRICT : SCORE.GAMES_AHEAD_1_EARLY;
         }
 
-        const lastGame = S.history[S.history.length-1];
-        if (lastGame && (lastGame.teamA.includes(pid)||lastGame.teamB.includes(pid))) score += 80000;
+        if (justPlayed.has(pid)) score += SCORE.JUST_PLAYED;
 
-        const RECENT_WIN = 8;
-        const recentPlayed = S.history.slice(-RECENT_WIN).filter(g=>g.teamA.includes(pid)||g.teamB.includes(pid)).length;
-        score += Math.pow(recentPlayed, 2) * 1500;
+        score += Math.pow(recentPlayed.get(pid)||0, 2) * SCORE.RECENT_PLAYED_SQ;
       }
 
       for (let x=0;x<4;x++) for (let y=x+1;y<4;y++) {
         if (isAlwaysTeammates(allFour[x], allFour[y])) continue; // คู่ซ้อมไม่นับโทษเจอซ้ำกันเอง
         const enc = encounterMatrix.get(allFour[x], allFour[y]);
         if (enc === 0) {
-          score -= 8000 * REPEAT_PENALTY_SCALE;
+          score += SCORE.NEVER_MET * REPEAT_PENALTY_SCALE;
         } else if (enc === 1) {
-          score += 5000 * REPEAT_PENALTY_SCALE;
+          score += SCORE.MET_ONCE * REPEAT_PENALTY_SCALE;
         } else if (enc === 2) {
-          score += 30000 * REPEAT_PENALTY_SCALE;
+          score += SCORE.MET_TWICE * REPEAT_PENALTY_SCALE;
         } else {
-          score += 100000 * REPEAT_PENALTY_SCALE * (enc - 1);
+          score += SCORE.MET_MANY * REPEAT_PENALTY_SCALE * (enc - 1);
         }
       }
 
@@ -862,27 +1020,27 @@ function searchMatch(ids, relax, mustId=null){
 
       if (!isFixedA) {
         const tmA = teammateMatrix.get(A[0],A[1]);
-        if (tmA > 0) score += Math.pow(tmA, 2) * 15000 * REPEAT_PENALTY_SCALE;
+        if (tmA > 0) score += Math.pow(tmA, 2) * SCORE.TEAMMATE_REPEAT_SQ * REPEAT_PENALTY_SCALE;
       }
       if (!isFixedB) {
         const tmB = teammateMatrix.get(B[0],B[1]);
-        if (tmB > 0) score += Math.pow(tmB, 2) * 15000 * REPEAT_PENALTY_SCALE;
+        if (tmB > 0) score += Math.pow(tmB, 2) * SCORE.TEAMMATE_REPEAT_SQ * REPEAT_PENALTY_SCALE;
       }
 
       let rptOpp = 0;
       for (const a of A) for (const b of B) rptOpp += opponentMatrix.get(a,b);
-      if (rptOpp > 0) score += Math.pow(rptOpp, 2) * 8000 * REPEAT_PENALTY_SCALE;
+      if (rptOpp > 0) score += Math.pow(rptOpp, 2) * SCORE.OPPONENT_REPEAT_SQ * REPEAT_PENALTY_SCALE;
 
       for (let x=0;x<4;x++) for (let y=x+1;y<4;y++) {
         if (isAlwaysTeammates(allFour[x], allFour[y])) continue; // คู่ซ้อมไม่นับโทษเจอซ้ำกันเอง
-        const recentEnc = recentEncounterCount(allFour[x], allFour[y], 6);
-        if (recentEnc > 0) score += recentEnc * 20000;
+        const rc = recentEnc.get(encounterMatrix.key(allFour[x], allFour[y]))||0;
+        if (rc > 0) score += rc * SCORE.RECENT_ENCOUNTER;
       }
 
       // [Mentor Rotation] H/S อยู่ฝั่งตรงข้ามกับ N → ลงโทษ (กัน N โดนมือหนักฝั่งตรงข้ามตบ)
       for (const x of A) for (const y of B) {
         const rx=getPlayer(x)?.rank, ry=getPlayer(y)?.rank;
-        if ((isHeavyRank(rx)&&ry==='N')||(isHeavyRank(ry)&&rx==='N')) score += 40000;
+        if ((isHeavyRank(rx)&&ry==='N')||(isHeavyRank(ry)&&rx==='N')) score += SCORE.HEAVY_VS_N;
       }
 
       // [Mentor Rotation] H/S ร่วมทีมกับ N → โบนัสเมื่อ N คนนั้นห่างพี่เลี้ยงมานาน / โทษถ้าเพิ่งได้ไป
@@ -893,22 +1051,22 @@ function searchMatch(ids, relax, mustId=null){
         else if (isHeavyRank(rT[1])&&rT[0]==='N') nId=T[0];
         if (!nId) continue;
         const starve=nStarve.get(nId)??0;
-        if (starve>=MENTOR_GAP) score -= 30000 + 3000*Math.min(starve,10);
-        else score += 45000; // เพิ่งได้พี่เลี้ยงไป — กลับไปเล่นแบบปกติ (MN/NN) ก่อน
+        if (starve>=MENTOR_GAP) score += SCORE.MENTOR_BASE + SCORE.MENTOR_PER_GAME*Math.min(starve,10);
+        else score += SCORE.MENTOR_TOO_SOON; // เพิ่งได้พี่เลี้ยงไป — กลับไปเล่นแบบปกติ (MN/NN) ก่อน
       }
 
       // [Mentor Rotation] รูปแบบคลาสสิก HN vs MM (น้ำหนัก 6 ต่อ 6) — แพทเทิร์นหลักของเกมพี่เลี้ยง
-      if ((teamIsHNish(rTA)&&teamOnlyMedium(rTB))||(teamIsHNish(rTB)&&teamOnlyMedium(rTA))) score -= 15000;
+      if ((teamIsHNish(rTA)&&teamOnlyMedium(rTB))||(teamIsHNish(rTB)&&teamOnlyMedium(rTA))) score += SCORE.HN_VS_MM;
 
       const bal = Math.abs(sumSkill(A)-sumSkill(B));
-      score += bal * 8;
+      score += bal * SCORE.BALANCE_PER_POINT;
 
       // โบนัสระบบพี่เลี้ยง (Mentor Bonus) เพื่อดันมือ N ให้มี M ช่วย
       const isMNA = A.some(id => getPlayer(id)?.rank === 'M') && A.some(id => getPlayer(id)?.rank === 'N');
       const isMNB = B.some(id => getPlayer(id)?.rank === 'M') && B.some(id => getPlayer(id)?.rank === 'N');
-      if (isMNA && isMNB) score -= 25000;
+      if (isMNA && isMNB) score += SCORE.MN_BOTH_SIDES;
 
-      score += (i+j+k+l) * 30;
+      score += (i+j+k+l) * SCORE.QUEUE_ORDER;
 
       if (score < bestScore) {
         bestScore = score;
@@ -928,6 +1086,23 @@ function addTeammatePartnersToPool(pool, availableIds){
     }
   }
   return pool;
+}
+
+// รายชื่อที่ให้ระบบเลือกจัด (pool) — ทุกปุ่มที่จัดอัตโนมัติต้องผ่านฟังก์ชันนี้ กฎจะได้ตรงกันทุกทาง:
+// • กันคู่ซ้อมที่อยู่ในแผนออก (เล่นเฉพาะเกมซ้อม)   • ดึงคนติดพักเฉพาะเมื่อคิวไม่พอและเปิด "บังคับจัดได้"
+// • เรียงคนเล่นน้อยก่อน → เจอคนอื่นน้อยก่อน (เสมอกันใช้ลำดับคิว)   • จำกัด 20 คน + ดึงคู่ "ทีมเดียวกันเสมอ" ตามมา
+// เรียก rebuildMatrices() ก่อนเสมอ (ใช้ encounterMatrix ในการเรียง)
+function buildCandidatePool(mustId=null){
+  const locked = new Set(trainingLockedIds());
+  const pick = ignoreCd => getQueueActive(ignoreCd).filter(p=>!locked.has(p.id));
+  let avail = pick(false);
+  if (avail.length < 4 && S.settings.allowForceAssign) avail = pick(true);
+  let ids = avail.map(p=>p.id);
+  const enc = new Map(ids.map(a=>[a, ids.reduce((s,b)=>b!==a ? s+encounterMatrix.get(a,b) : s, 0)]));
+  ids.sort((a,b)=>(getPlayer(a).timesPlayedToday-getPlayer(b).timesPlayedToday) || (enc.get(a)-enc.get(b)));
+  ids = ids.slice(0,20);
+  if (mustId && !ids.includes(mustId)) ids = [mustId, ...ids.slice(0,19)];
+  return addTeammatePartnersToPool(ids, avail.map(p=>p.id));
 }
 
 // ลองกฎเต็มก่อนเสมอ แล้วค่อยผ่อนเป็นชั้นๆ (โหมด "บังคับจัดได้" มีผลแค่ขยาย pool ให้รวมคนพัก)
@@ -962,27 +1137,8 @@ function autoAssign(){
     if (deployTraining(court)) { trainingDeployed = true; rebuildMatrices(); break; }
   }
 
-  const locked = new Set(trainingLockedIds());
-  let allActive = getQueueActive().filter(p=>!locked.has(p.id));
-  if (allActive.length < 4 && S.settings.allowForceAssign) {
-      allActive = getQueueActive(true).filter(p=>!locked.has(p.id));
-  }
-  if (allActive.length < 4){ if(!reservedDeployed&&!trainingDeployed) toast('ผู้เล่นไม่พอ'); return; }
-
-  let candIds = allActive.map(p => p.id);
-
-  candIds.sort((a,b) => {
-    const pA = getPlayer(a);
-    const pB = getPlayer(b);
-    if (pA.timesPlayedToday !== pB.timesPlayedToday) {
-      return pA.timesPlayedToday - pB.timesPlayedToday; 
-    }
-    const encA = candIds.reduce((sum, id) => id!==a ? sum+encounterMatrix.get(a,id) : sum, 0);
-    const encB = candIds.reduce((sum, id) => id!==b ? sum+encounterMatrix.get(b,id) : sum, 0);
-    return encA - encB;
-  });
-
-  candIds = addTeammatePartnersToPool(candIds.slice(0, 20), allActive.map(p=>p.id));
+  const candIds = buildCandidatePool();
+  if (candIds.length < 4){ if(!reservedDeployed&&!trainingDeployed) toast('ผู้เล่นไม่พอ'); render(); return; }
 
   let relaxedAny = false;
   for (const court of idle) {
@@ -1003,30 +1159,11 @@ function autoAssign(){
 function openPreviewDialog() {
   rebuildMatrices();
 
-  const lockedPv = new Set(trainingLockedIds());
-  let allActive = getQueueActive().filter(p=>!lockedPv.has(p.id));
-  if (allActive.length < 4 && S.settings.allowForceAssign) {
-      allActive = getQueueActive(true).filter(p=>!lockedPv.has(p.id));
-  }
-  if (allActive.length < 4) {
+  const candIds = buildCandidatePool();
+  if (candIds.length < 4) {
       toast('ผู้เล่นในคิวไม่พอ (ต้องมี 4 คนขึ้นไป)');
       return;
   }
-
-  let candIds = allActive.map(p => p.id);
-
-  candIds.sort((a,b) => {
-    const pA = getPlayer(a);
-    const pB = getPlayer(b);
-    if (pA.timesPlayedToday !== pB.timesPlayedToday) {
-      return pA.timesPlayedToday - pB.timesPlayedToday; 
-    }
-    const encA = candIds.reduce((sum, id) => id!==a ? sum+encounterMatrix.get(a,id) : sum, 0);
-    const encB = candIds.reduce((sum, id) => id!==b ? sum+encounterMatrix.get(b,id) : sum, 0);
-    return encA - encB;
-  });
-
-  candIds = addTeammatePartnersToPool(candIds.slice(0, 20), allActive.map(p=>p.id));
 
   let targetCourt = S.courts.find(c => !c.match);
   let courtLabel = targetCourt ? targetCourt.label : 'สนามว่างถัดไป (สนามเต็ม)';
@@ -1131,19 +1268,27 @@ function finishMatch(court){
   const rB = teamRanksString(m.teamB);
 
   const fA=m.teamA.filter(Boolean), fB=m.teamB.filter(Boolean);
+
+  // ลดตัวนับพักของคนที่รออยู่ — จดไว้ว่าลดใครบ้าง เพื่อให้ "ยกเลิกเกมล่าสุด" คืนค่าได้ถูก
+  const cooldownDec=[];
+  S.players.forEach(p => {
+    if (p.active && !onCourt(p.id) && p.cooldown>0){ p.cooldown = Math.max(0,p.cooldown-1); cooldownDec.push(p.id); }
+  });
+
   S.history.push({
-    id:m.id, court:m.court, startedAt:m.startedAt, endedAt:m.endedAt,
+    id:m.id, court:m.court, courtLabel:court.label, startedAt:m.startedAt, endedAt:m.endedAt,
     teamA:fA, teamB:fB, note:m.note,
     ranksA: rA, ranksB: rB,
     // เก็บชื่อ ณ ตอนจบเกม — ประวัติจะอ่านได้ตลอดแม้ผู้เล่นถูกลบทีหลัง
     namesA: fA.map(id=>getPlayer(id)?.name||safeName(id)||'?'),
-    namesB: fB.map(id=>getPlayer(id)?.name||safeName(id)||'?')
+    namesB: fB.map(id=>getPlayer(id)?.name||safeName(id)||'?'),
+    cooldownDec,
+    trainingGame: m.trainingGame || undefined
   });
   rebuildNameSnapshots();
 
-  S.players.forEach(p => {
-    if (p.active && !onCourt(p.id) && p.cooldown>0) p.cooldown = Math.max(0,p.cooldown-1);
-  });
+  // [ซ้อมทีม 🎯] นับความคืบหน้าตอน "จบเกม" (ไม่ใช่ตอนเริ่ม) — เกมซ้อมที่ถูกทิ้งกลางทางจะไม่ถูกนับ
+  if (m.trainingGame) countTrainingGame(m.trainingGame, +1);
 
   for (const id of [...m.teamA,...m.teamB]) {
     if (!id) continue;
@@ -1151,6 +1296,21 @@ function finishMatch(court){
   }
   court.match = null;
   render(); save();
+}
+
+// [ซ้อมทีม 🎯] บวก/ลบความคืบหน้าของแผน (delta=+1 ตอนจบเกมซ้อม, -1 ตอนยกเลิกเกมนั้น)
+// tg = {team:[a,b], vs:[c,d]} — นับเฉพาะเมื่อคู่ซ้อมตรงกับแผนปัจจุบัน
+function countTrainingGame(tg, delta){
+  const t=S.training;
+  if(!t || !tg || !Array.isArray(tg.team) || !Array.isArray(tg.vs)) return;
+  const sameTeam=[...tg.team].sort().join('|')===[...t.team].sort().join('|');
+  if(!sameTeam) return;
+  const [c,d]=tg.vs;
+  const pr=(t.pairs||[]).find(x=>(x.a===c&&x.b===d)||(x.a===d&&x.b===c));
+  if(pr) pr.used=Math.max(0,(pr.used||0)+delta);
+  const wasActive=(t.done||0)<t.total;
+  t.done=Math.max(0,Math.min(t.total,(t.done||0)+delta));
+  if(delta>0 && wasActive && t.done>=t.total) toast('🎯 ซ้อมทีมครบตามแผนแล้ว — ปลดล็อกคู่ซ้อมกลับเป็นปกติ',4500);
 }
 
 // ล้างกฎคู่บุคคล/คิวจอง ที่อ้างถึงผู้เล่นที่ไม่มีอยู่แล้ว (หลังลบผู้เล่น)
@@ -1285,15 +1445,22 @@ function renderQueue(){
   // [ซ้อมทีม 🎯] แถบสถานะแผนซ้อม
   const tr = activeTraining();
   if (tr) {
-    let anyReady=false;
     const pairTxt = (tr.pairs||[]).map(pr=>{
-      const ready = [pr.a,pr.b].every(id=>{ const p=getPlayer(id); return p&&p.active&&!onCourt(id); });
-      if(ready) anyReady=true;
+      const ready = [pr.a,pr.b].every(id=>{ const p=getPlayer(id); return p&&p.active&&!onCourt(id)&&!(p.cooldown>0); });
       return `<span class="${ready?'':'opacity-40'}">${escHTML(safeName(pr.a))}+${escHTML(safeName(pr.b))}${pr.used?` <span class="text-slate-400">(${pr.used})</span>`:''}</span>`;
     }).join(' · ');
-    const teamOnCourt = tr.team.some(id=>onCourt(id));
-    const status = teamOnCourt ? '<span class="text-violet-700">กำลังเล่นเกมซ้อม</span>'
-      : (anyReady ? '<span class="text-green-700">พร้อมลงเกมถัดไป</span>' : '<span class="text-amber-700">⏳ รอคู่แข่งว่าง</span>');
+    // ใช้ตรรกะเดียวกับ deployTraining → ข้อความตรงกับสิ่งที่ระบบจะทำจริง
+    const st = trainingState(tr);
+    const names = st.names ? escHTML(st.names.join(', ')) : '';
+    const status = {
+      'playing-training':  `<span class="text-violet-700">กำลังเล่นเกมซ้อมที่ ${escHTML(st.court||'')}</span>`,
+      'playing-other':     `<span class="text-violet-700">อยู่ในสนาม ${escHTML(st.court||'')} (เกมที่จัดเอง ไม่นับเป็นเกมซ้อม)</span>`,
+      'team-away':         `<span class="text-red-700">⏸ ${names} ไม่อยู่ (กลับบ้าน/ปิดใช้งาน)</span>`,
+      'team-resting':      `<span class="text-red-700">⏸ ${names} ติดพัก</span>`,
+      'team-ahead':        `<span class="text-amber-700">⏸ คู่ซ้อมเล่นนำคนอื่นอยู่ — รอคนอื่นตามทัน</span>`,
+      'waiting-opponents': `<span class="text-amber-700">⏳ รอคู่แข่งว่าง</span>`,
+      'ready':             `<span class="text-green-700">พร้อมลงเกมถัดไป (เจอ ${escHTML(safeName(st.pick?.a))}+${escHTML(safeName(st.pick?.b))})</span>`
+    }[st.code] || '';
     const banner = document.createElement('div');
     banner.className = 'p-2 rounded-xl border-2 text-sm flex items-center justify-between gap-2';
     banner.style.cssText = 'border-color:#c4b5fd;background:#f5f3ff';
@@ -1410,7 +1577,7 @@ function renderHistory(){
     const dur=g.endedAt?` <span class="font-bold text-sky-700">(${formatDuration(g.startedAt,g.endedAt)})</span>`:'';
     const row=document.createElement('div');
     row.className='flex items-center justify-between p-2 rounded-xl border bg-white';
-    row.innerHTML=`<div class="text-sm"><span class="font-semibold">${escHTML(getCourtLabelById(g.court))}</span> • ${new Date(g.startedAt).toLocaleTimeString('th-TH')} — <b>${aNames}</b> (${aRanks}) <span class="mx-1">vs</span> <b>${bNames}</b> (${bRanks})${g.note?` • ${escHTML(g.note)}`:''}${dur}</div>`;
+    row.innerHTML=`<div class="text-sm"><span class="font-semibold">${escHTML(historyCourtLabel(g))}</span> • ${new Date(g.startedAt).toLocaleTimeString('th-TH')} — <b>${aNames}</b> (${aRanks}) <span class="mx-1">vs</span> <b>${bNames}</b> (${bRanks})${g.note?` • ${escHTML(g.note)}`:''}${dur}</div>`;
     el.appendChild(row);
   }
 }
@@ -1513,26 +1680,46 @@ function undoLastGame(){
   const busy=[...lastGame.teamA,...lastGame.teamB].filter(id=>id&&onCourt(id));
   if(busy.length){ toast(`ย้อนไม่ได้: ${busy.map(safeName).join(', ')} กำลังเล่นอยู่ในสนามอื่น`,4000); return; }
 
-  // คืนไปที่สนามเดิม (ทับเกมที่จัดใหม่ ถ้ามี) — ถ้าสนามเดิมถูกลบไปแล้ว ใช้สนามว่างแทน
-  const court=S.courts.find(c=>c.id===lastGame.court)||S.courts.find(c=>!c.match);
-  if(!court){ toast('ไม่พบสนามว่างสำหรับคืนเกมนี้'); return; }
+  // เลือกสนาม: สนามเดิมถ้าว่าง → สนามว่างอื่น → ถ้าไม่มีสนามว่างเลยค่อยทับเกมในสนามเดิม (ต้องยืนยัน)
+  const orig=S.courts.find(c=>c.id===lastGame.court);
+  let court=(orig&&!orig.match)?orig:S.courts.find(c=>!c.match);
+  let bump=null;
+  if(!court){ court=orig||S.courts[0]; bump=court; }
+  if(!court){ toast('ไม่พบสนามสำหรับคืนเกมนี้'); return; }
 
-  S.history.pop();
-  // ถ้าสนามเดิมมีเกมอยู่ คืนผู้เล่นกลุ่มนั้นกลับเข้าคิวก่อนทับ
-  if(court.match){
-    for(const id of [...court.match.teamA,...court.match.teamB]){
+  const gameTxt=`${lastGame.teamA.map(safeName).join(' & ')} vs ${lastGame.teamB.map(safeName).join(' & ')}`;
+  let msg=`ยกเลิกเกมล่าสุด: ${gameTxt}\nเกมนี้จะถูกคืนลง ${court.label}`;
+  if(bump){
+    const names=[...bump.match.teamA,...bump.match.teamB].filter(Boolean).map(safeName).join(', ');
+    msg+=`\n\n⚠️ ไม่มีสนามว่าง — เกมที่กำลังเล่นใน ${bump.label} (${names}) จะถูกยกเลิก ไม่บันทึกลงประวัติ และผู้เล่นกลับเข้าคิว`;
+  }
+  if(!confirm(`${msg}\n\nยืนยันไหม?`)) return;
+
+  if(bump){
+    for(const id of [...bump.match.teamA,...bump.match.teamB]){
       const p=getPlayer(id); if(p){ p.active=true; p.cooldown=0; p.enqueuedAt=now(); }
     }
+    bump.match=null;
   }
+
+  S.history.pop();
+  // คืนตัวนับพักที่ถูกลดไปตอนจบเกมนั้น (ข้ามคนที่ตอนนี้ลงสนามไปแล้ว)
+  for(const id of (lastGame.cooldownDec||[])){
+    const p=getPlayer(id); if(p && !onCourt(id)) p.cooldown=(p.cooldown||0)+1;
+  }
+  // เกมซ้อม: ย้อนตัวนับแผน (จะถูกนับใหม่ตอนจบเกมอีกครั้ง)
+  if(lastGame.trainingGame) countTrainingGame(lastGame.trainingGame,-1);
+
   // คืน match กลับลงสนาม (ย้อน finishMatch)
   court.match={ id:lastGame.id, court:court.id, startedAt:lastGame.startedAt,
-    teamA:[...lastGame.teamA], teamB:[...lastGame.teamB], note:lastGame.note };
+    teamA:[...lastGame.teamA], teamB:[...lastGame.teamB], note:lastGame.note,
+    trainingGame:lastGame.trainingGame };
 
   // ผู้เล่นกลับเข้าสนาม: active=false, cooldown=0 (เหมือนตอนกำลังเล่น)
   for(const id of [...lastGame.teamA,...lastGame.teamB]){
     const p=getPlayer(id); if(p){ p.active=false; p.cooldown=0; p.lastPlayedAt=lastGame.startedAt; }
   }
-  toast('คืนเกมล่าสุดกลับลงสนามแล้ว'); render(); save();
+  toast(court.id===lastGame.court?'คืนเกมล่าสุดกลับลงสนามเดิมแล้ว':`คืนเกมล่าสุดลง ${court.label} แล้ว`); render(); save();
 }
 
 let removeInterval=null;
@@ -1682,11 +1869,15 @@ function deployReserved(court){
   }
   if(subs.length){
     const used=new Set([...teamA,...teamB].filter(Boolean));
-    const cands=getQueueForReplaceSorted(false).map(p=>p.id).filter(id=>!used.has(id));
+    const locked=new Set(trainingLockedIds());   // คนในแผนซ้อมเล่นได้เฉพาะเกมซ้อม
+    const free=id=>{ const q=getPlayer(id); return !!q&&q.active&&!onCourt(id); };
+    const cands=getQueueForReplaceSorted(false).map(p=>p.id).filter(id=>!used.has(id)&&!locked.has(id));
     for(const s of subs){
       let pick=null;
       for(const cid of cands){
         if(used.has(cid)) continue;
+        // อย่าดึงคนที่มีคู่ "ทีมเดียวกันเสมอ" ว่างอยู่มาคนเดียว (จะแยกคู่)
+        if(getAlwaysTeammatesPartners(cid).some(x=>free(x)&&!used.has(x))) continue;
         s.t[s.i]=cid;
         if(canFormUserConstraints(teamA.filter(Boolean),teamB.filter(Boolean))){ pick=cid; break; }
         s.t[s.i]=null;
@@ -1709,37 +1900,49 @@ function deployReserved(court){
 
 // [ซ้อมทีม 🎯] จัดเกมซ้อมลงสนาม — ลงเฉพาะเมื่อคู่ซ้อมถึงคิวจริง (ไม่เบียดคิวคนอื่น)
 // และมีคู่แข่งที่เตรียมไว้ว่างครบ 2 คน คู่ที่เจอกันน้อยกว่าได้คิวก่อน
-function deployTraining(court){
-  const t=activeTraining();
-  if(!t||!court||court.match) return false;
+// [ซ้อมทีม 🎯] สถานะของแผนตอนนี้ — ใช้ทั้งตัดสินใจลงเกมซ้อม และแสดงบนแถบสถานะ (ให้ตรงกันเสมอ)
+// ต้อง recalculateGames() ก่อนเรียก (ใช้ timesPlayedToday)
+function trainingState(t){
   const [a,b]=t.team;
-  recalculateGames();
-  const ready=id=>{ const p=getPlayer(id); return !!p&&p.active&&!onCourt(id)&&(p.cooldown||0)===0; };
-  if(!ready(a)||!ready(b)) return false;
+  const onC=S.courts.find(c=>c.match&&[...c.match.teamA,...c.match.teamB].some(id=>t.team.includes(id)));
+  // note: เกมซ้อมที่เริ่มในเวอร์ชันเก่ายังไม่มีป้าย trainingGame (ถูกนับไปแล้วตอนเริ่ม) — ดูจาก note แทน
+  if(onC) return {code: (onC.match.trainingGame||onC.match.note==='เกมซ้อมทีม') ? 'playing-training' : 'playing-other', court:onC.label};
+  const away=t.team.filter(id=>{ const p=getPlayer(id); return !p||!p.active; });
+  if(away.length) return {code:'team-away', names:away.map(safeName)};
+  const resting=t.team.filter(id=>(getPlayer(id)?.cooldown||0)>0);
+  if(resting.length) return {code:'team-resting', names:resting.map(safeName)};
 
   // ความยุติธรรมเทียบกับ "คนอื่นที่ไม่ใช่คู่ซ้อม" เพราะคู่ซ้อมถูกกันออกจากเกมปกติอยู่แล้ว
   const others=S.players.filter(p=>p.active&&!t.team.includes(p.id));
   const minOthers=others.length?Math.min(...others.map(p=>p.timesPlayedToday)):0;
   const gap=id=>((getPlayer(id)?.timesPlayedToday||0)-minOthers);
   // กันคู่ซ้อมแซงคิวคนอื่น (กรณีเริ่มแผนตอนที่คู่ซ้อมเล่นนำอยู่แล้ว)
-  if(gap(a)>=2||gap(b)>=2) return false;
+  if(gap(a)>=2||gap(b)>=2) return {code:'team-ahead'};
 
+  const ready=id=>{ const p=getPlayer(id); return !!p&&p.active&&!onCourt(id)&&(p.cooldown||0)===0; };
   const games=pr=>getPlayer(pr.a).timesPlayedToday+getPlayer(pr.b).timesPlayedToday;
   const elig=(t.pairs||[])
     .filter(pr=>ready(pr.a)&&ready(pr.b))
     .filter(pr=>![pr.a,pr.b].includes(a)&&![pr.a,pr.b].includes(b))
     .sort((x,y)=>((x.used||0)-(y.used||0))||(games(x)-games(y)));
-  if(!elig.length) return false;
+  if(!elig.length) return {code:'waiting-opponents'};
 
   // เลือกคู่ที่ยังไม่เล่นเกินคนอื่นก่อน — ถ้าไม่มีก็ใช้คู่ที่ว่างอยู่ (กันแผนค้าง)
   const fairFirst=elig.filter(pr=>gap(pr.a)<=1&&gap(pr.b)<=1);
-  const pick=(fairFirst.length?fairFirst:elig)[0];
+  return {code:'ready', pick:(fairFirst.length?fairFirst:elig)[0]};
+}
+
+function deployTraining(court){
+  const t=activeTraining();
+  if(!t||!court||court.match) return false;
+  recalculateGames();
+  const st=trainingState(t);
+  if(st.code!=='ready') return false;
+  const [a,b]=t.team, pick=st.pick;
   if(!startMatch(court,[a,b],[pick.a,pick.b],'เกมซ้อมทีม')) return false;
-  pick.used=(pick.used||0)+1;
-  t.done=(t.done||0)+1;
-  const left=t.total-t.done;
-  toast(`🎯 เกมซ้อม ${t.done}/${t.total}: ${safeName(a)}+${safeName(b)} เจอ ${safeName(pick.a)}+${safeName(pick.b)} ที่ ${court.label}`,4000);
-  if(left<=0){ S.training=null; toast('🎯 ซ้อมทีมครบตามแผนแล้ว — ปลดล็อกคู่ซ้อมกลับเป็นปกติ',4500); }
+  // ติดป้ายเกมซ้อมไว้ที่แมทช์ — ความคืบหน้าจะถูกนับตอน finishMatch
+  court.match.trainingGame={team:[a,b], vs:[pick.a,pick.b]};
+  toast(`🎯 เกมซ้อม ${(t.done||0)+1}/${t.total}: ${safeName(a)}+${safeName(b)} เจอ ${safeName(pick.a)}+${safeName(pick.b)} ที่ ${court.label}`,4000);
   render(); save();
   return true;
 }
@@ -1759,6 +1962,15 @@ function listRuleViolations(teamA,teamB){
     const t=team.filter(Boolean);
     for(let i=0;i<t.length;i++) for(let j=i+1;j<t.length;j++){
       if(violatesOpponentsOnly(t[i],t[j])) msgs.push(`${safeName(t[i])} & ${safeName(t[j])} — ต้องคนละทีม แต่ถูกจัดทีมเดียวกัน`);
+    }
+  }
+  // คู่ "ทีมเดียวกันเสมอ" / แผนซ้อม ถูกแยก: คนหนึ่งลง แต่อีกคนว่างอยู่และไม่ได้อยู่ในเกมนี้
+  for(const id of ids){
+    for(const partner of getAlwaysTeammatesPartners(id)){
+      if(ids.includes(partner)) continue;
+      const q=getPlayer(partner);
+      if(q && q.active && !onCourt(partner))
+        msgs.push(`${safeName(id)} ต้องลงคู่กับ ${safeName(partner)} (${isTrainingPair(id,partner)?'แผนซ้อมทีม':'ทีมเดียวกันเสมอ'}) แต่ ${safeName(partner)} ไม่ได้อยู่ในเกมนี้`);
     }
   }
   const fA=teamA.filter(Boolean), fB=teamB.filter(Boolean);
@@ -1836,13 +2048,9 @@ function handleActionEvent(e){
     if(S.reserved){ deployReserved(court); return; }
     // [ซ้อมทีม 🎯] ถ้าถึงคิวและคู่แข่งพร้อม ให้เกมซ้อมลงก่อน
     if(deployTraining(court)) return;
-    // ดึงคนที่ติดพักมาเป็นตัวเลือกเฉพาะเมื่อคิวไม่พอ (ให้ตรงกับ "จัดอัตโนมัติ")
-    const lockedIds=new Set(trainingLockedIds());
-    let q=getQueueActive().filter(p=>!lockedIds.has(p.id));
-    if(q.length<4 && S.settings.allowForceAssign) q=getQueueActive(true).filter(p=>!lockedIds.has(p.id));
-    if(q.length<4){ toast('ผู้เล่นไม่พอ'); return; }
     rebuildMatrices();
-    const pool=addTeammatePartnersToPool(q.slice(0,Math.min(20,q.length)).map(p=>p.id), q.map(p=>p.id));
+    const pool=buildCandidatePool();
+    if(pool.length<4){ toast('ผู้เล่นไม่พอ'); return; }
     const best=chooseBestMatch(pool);
     if(!best){ toast('จัดผู้เล่นไม่ได้ตามกฎ/บาลานซ์'); return; }
     if(!startMatch(court,best.teamA,best.teamB)) return;
@@ -1852,15 +2060,18 @@ function handleActionEvent(e){
     const pid=a.dataset.id;
     const p=getPlayer(pid); if(!p) return;
     const court=S.courts.find(c=>!c.match); if(!court){ toast('ไม่มีสนามว่าง'); return; }
+    const closeActs=()=>{ if(document.getElementById('dlgActions').open) document.getElementById('dlgActions').close(); };
+    // [ซ้อมทีม 🎯] คนในแผนซ้อมลงได้เฉพาะเกมซ้อม — ไม่ให้เกมปกติกินโควตาจนแผนค้าง
+    if(trainingLockedIds().includes(pid)){
+      if(deployTraining(court)){ closeActs(); return; }
+      toast(`${p.name} อยู่ในแผนซ้อมทีม — ลงได้เฉพาะเกมซ้อม (ดูสถานะที่แถบสีม่วง) หรือยกเลิกแผนก่อน`,4500);
+      return;
+    }
     // ผู้ใช้สั่งลงเอง = ยกเลิกพักให้ แต่คืนสถานะถ้าจัดไม่สำเร็จ
     const prevCooldown=p.cooldown||0; if(prevCooldown>0) p.cooldown=0;
-    let q=getQueueActive();
-    if(q.length<4 && S.settings.allowForceAssign) q=getQueueActive(true);
-    if(q.length<4){ p.cooldown=prevCooldown; toast('ผู้เล่นไม่พอ'); return; }
     rebuildMatrices();
-    let pool=q.slice(0,Math.min(20,q.length)).map(x=>x.id);
-    if(!pool.includes(pid)) pool=[pid,...pool.slice(0,19)];
-    pool=addTeammatePartnersToPool(pool, q.map(x=>x.id));
+    const pool=buildCandidatePool(pid);
+    if(pool.length<4){ p.cooldown=prevCooldown; toast('ผู้เล่นไม่พอ'); return; }
     const best=chooseBestMatch(pool,pid);
     if(!best){ p.cooldown=prevCooldown; toast('จัดกลุ่มไม่ได้'); return; }
     if(!startMatch(court,best.teamA,best.teamB)){ p.cooldown=prevCooldown; return; }
@@ -1951,15 +2162,15 @@ document.getElementById('btnSave').onclick=()=>{
   a.download=name; a.click();
   toast('⬇️ ดาวน์โหลดไฟล์สำรองแล้ว');
 };
+// กู้คืนแบบปลอดภัย: ตรวจ/ซ่อมข้อมูลในสำเนาก่อน → ลอง render → ถ้าล้มคืนค่าเดิมทั้งหมด (ไม่ทิ้งแอปค้างครึ่งทาง)
 function applyBackup(data){
-  if(!data||!Array.isArray(data.players)||!Array.isArray(data.history)) return false;
-  data.settings={...DEFAULT.settings,...(data.settings||{})};
-  data.settings.SKILL_WEIGHTS={...DEFAULT.settings.SKILL_WEIGHTS,...(data.settings.SKILL_WEIGHTS||{})};
-  data.constraints=data.constraints||[];
-  data.reserved=data.reserved||null;
-  data.training=data.training||null;
-  data.courts=(Array.isArray(data.courts)&&data.courts.length)?data.courts:mkCourts(data.settings.COURTS||3);
-  S=data; render(); save();
+  let clean;
+  try{ clean=normalizeState(data); }catch(e){ return false; }
+  const prev=S;
+  S=clean; pruneOrphans();
+  try{ render(); }
+  catch(e){ console.error(e); S=prev; render(); return false; }
+  save();
   return true;
 }
 document.getElementById('btnLoad').onclick=()=>{
@@ -1972,7 +2183,10 @@ document.getElementById('btnLoad').onclick=()=>{
         const data=JSON.parse(reader.result);
         if(!data||!Array.isArray(data.players)||!Array.isArray(data.history)){ toast('❌ ไฟล์ไม่ถูกต้อง — ไม่ใช่ไฟล์สำรองของโปรแกรมนี้'); return; }
         if(!confirm(`กู้คืนข้อมูล: ผู้เล่น ${data.players.length} คน, ประวัติ ${data.history.length} เกม\nข้อมูลปัจจุบันจะถูกเขียนทับทั้งหมด?`)) return;
-        if(applyBackup(data)) toast('⬆️ กู้คืนข้อมูลเรียบร้อย');
+        if(applyBackup(data)){
+          const dropped=(data.history.length-S.history.length)+(data.players.length-S.players.length);
+          toast(dropped>0 ? `⬆️ กู้คืนแล้ว — ข้ามข้อมูลที่เสีย ${dropped} รายการ` : '⬆️ กู้คืนข้อมูลเรียบร้อย', 4000);
+        } else toast('❌ ไฟล์เสียเกินกว่าจะกู้ได้ — ข้อมูลปัจจุบันยังอยู่ครบ ไม่ถูกแตะต้อง', 4500);
       }catch(e){ toast('❌ ไฟล์ไม่ถูกต้อง — กู้คืนไม่สำเร็จ'); }
     };
     reader.readAsText(f);
@@ -1999,10 +2213,8 @@ document.getElementById('btnClear').onclick=()=>{ if(confirm('ล้างข้
 document.getElementById('btnMatrix').onclick=()=>{ rebuildMatrices(); buildEncounterMatrix(); document.getElementById('dlgMatrix').showModal(); };
 document.getElementById('dlgMatrixClose').onclick=()=>document.getElementById('dlgMatrix').close();
 
-document.getElementById('btnUndoHistory').onclick=()=>{
-  if(S.history.length===0){ toast('ไม่มีประวัติเกมให้ยกเลิก'); return; }
-  if(confirm('ยืนยันยกเลิกเกมล่าสุด? ผู้เล่นจะถูกคืนกลับลงสนามเดิม')) undoLastGame();
-};
+// ยืนยันอยู่ใน undoLastGame (ข้อความบอกสนามปลายทาง + เตือนถ้าต้องทับเกม)
+document.getElementById('btnUndoHistory').onclick=()=>undoLastGame();
 document.getElementById('btnStats').onclick=()=>{ buildStatsDialog(); document.getElementById('dlgStats').showModal(); };
 document.getElementById('dlgStatsClose').onclick=()=>document.getElementById('dlgStats').close();
 document.getElementById('btnHN').onclick=()=>{ buildHNDialog(); document.getElementById('dlgHN').showModal(); };
@@ -2035,7 +2247,7 @@ function addPairRow(a='',b='',used=0){
   wrap.appendChild(row);
 }
 function openTrainingDialog(){
-  const t=S.training;
+  const t=activeTraining(); // แผนที่ครบแล้วถูกเก็บไว้ให้ "ยกเลิกเกมล่าสุด" ย้อนได้ แต่เปิดเป็นฟอร์มใหม่
   document.getElementById('tTeamA').innerHTML=trainingPlayerOptions(t?.team?.[0]||'');
   document.getElementById('tTeamB').innerHTML=trainingPlayerOptions(t?.team?.[1]||'');
   document.getElementById('tGames').value=t?.total||6;
@@ -2089,7 +2301,9 @@ document.getElementById('btnTrainingSave').onclick=()=>{
   }
   if(warns.length && !confirm(`⚠️ คู่แข่งบางคู่ขัดกับกฎ:\n- ${warns.join('\n- ')}\n\nเริ่มแผนซ้อมต่อไหม?`)) return;
 
-  S.training={team:[a,b],pairs,total,done:S.training?.done||0};
+  // แก้แผนที่กำลังเดินอยู่ = เก็บความคืบหน้าเดิม / แผนใหม่ = เริ่ม 0
+  const keepDone = activeTraining() ? Math.min(S.training.done||0, total) : 0;
+  S.training={team:[a,b],pairs,total,done:keepDone};
   document.getElementById('dlgTraining').close();
   render(); save();
   toast(`🎯 เริ่มแผนซ้อม: ${safeName(a)}+${safeName(b)} ${total} เกม · คู่แข่ง ${pairs.length} คู่`,4500);
@@ -2196,14 +2410,28 @@ document.getElementById('btnClearCooldowns').onclick=()=>{
 };
 
 document.getElementById('btnApplyCourt').onclick=()=>{
-  const newCount=+document.getElementById('inpCourts').value||3;
-  const newMinutes=+document.getElementById('inpMinutes').value||15;
+  const inpC=document.getElementById('inpCourts'), inpM=document.getElementById('inpMinutes');
+  const newCount=Number(inpC.value), newMinutes=Number(inpM.value);
+  // ค่านอกช่วง → ไม่ทำอะไรเลย (ไม่เดา) เพราะการลดสนามมีผลกับเกมที่กำลังเล่น
+  if(!Number.isInteger(newCount)||newCount<1||newCount>8){ toast('❌ จำนวนสนามต้องเป็นเลข 1–8'); inpC.value=S.courts.length; return; }
+  if(!Number.isFinite(newMinutes)||newMinutes<5||newMinutes>60){ toast('❌ เวลาเป้าหมายต้องอยู่ระหว่าง 5–60 นาที'); inpM.value=S.settings.MATCH_MINUTES; return; }
   S.settings.MATCH_MINUTES=newMinutes;
+
   const cur=S.courts.length;
   if(newCount>cur){ for(let i=cur;i<newCount;i++) S.courts.push({id:uid(),label:`สนาม ${i+1}`,match:null}); }
   else if(newCount<cur){
-    const removed=S.courts.splice(newCount);
-    for(const c of removed) if(c.match) for(const id of [...c.match.teamA,...c.match.teamB]) if(id){ const p=getPlayer(id); if(p){p.active=true;p.enqueuedAt=now();} }
+    // สนามที่จะถูกปิดมีเกมอยู่ → ยืนยัน แล้วจบเกมลงประวัติก่อน (ไม่ทิ้งเกมเงียบๆ)
+    const busy=S.courts.slice(newCount).filter(c=>c.match);
+    if(busy.length){
+      const lines=busy.map(c=>`• ${c.label}: ${[...c.match.teamA,...c.match.teamB].filter(Boolean).map(safeName).join(', ')}`).join('\n');
+      if(!confirm(`สนามที่จะถูกปิดมีเกมกำลังเล่นอยู่:\n${lines}\n\nระบบจะ "จบเกม" เหล่านี้ลงประวัติก่อน แล้วจึงลดสนาม — ยืนยันไหม?`)){
+        inpC.value=cur; render(); save();
+        toast(`ยังคง ${cur} สนามเหมือนเดิม • ตั้งเวลาเป้าหมาย ${newMinutes} นาทีแล้ว`);
+        return;
+      }
+      for(const c of busy) finishMatch(c);
+    }
+    S.courts.splice(newCount);
   }
   S.settings.COURTS=newCount; render(); save();
 };
@@ -2218,7 +2446,10 @@ document.getElementById('chkAdmin').onchange=()=>{ S.settings.adminMode=document
 document.getElementById('filter').oninput=document.getElementById('rankFilter').onchange=()=>renderQueue();
 
 addEventListener('change',(e)=>{
-  if(e.target.matches('[data-w]')){ S.settings.SKILL_WEIGHTS[e.target.dataset.w]=+e.target.value||1; save(); }
+  if(e.target.matches('[data-w]')){
+    const k=e.target.dataset.w, v=clampNum(e.target.value,1,10,S.settings.SKILL_WEIGHTS[k]);
+    e.target.value=v; S.settings.SKILL_WEIGHTS[k]=v; save();
+  }
   if(e.target.matches('input[data-cid]')){ const court=S.courts.find(x=>x.id===e.target.dataset.cid); if(court){court.label=e.target.value||court.label;save();renderHistory();} }
 });
 
@@ -2278,7 +2509,7 @@ document.getElementById('dlgReplaceClose').onclick=()=>document.getElementById('
 function csvCell(v){ v=String(v??''); return /[",\n]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v; }
 function exportCSV(){
   const head=['id','court','startedAt','endedAt','teamA1','teamA2','teamB1','teamB2','note','ranksA','ranksB'];
-  const rows=S.history.map(g=>[g.id,getCourtLabelById(g.court),new Date(g.startedAt).toISOString(),g.endedAt?new Date(g.endedAt).toISOString():'',
+  const rows=S.history.map(g=>[g.id,historyCourtLabel(g),new Date(g.startedAt).toISOString(),g.endedAt?new Date(g.endedAt).toISOString():'',
     safeName(g.teamA[0]),safeName(g.teamA[1]),safeName(g.teamB[0]),safeName(g.teamB[1]),g.note||'',
     g.ranksA || teamRanksString(g.teamA),
     g.ranksB || teamRanksString(g.teamB)]);
@@ -2291,7 +2522,7 @@ function download(name,text){ const a=document.createElement('a'); a.href=URL.cr
 function rankAtGame(pid, idx){
   const p=getPlayer(pid); if(!p) return '?';
   if(p.originalRank!=='F') return p.originalRank||p.rank;
-  let n=p.baseGames||0;
+  let n=0; // นับเฉพาะเกมที่เล่นจริงก่อนเกมนี้ (ไม่รวมแต้มต่อคนมาสาย) — ตรงกับ recalculateGames
   for(let i=0;i<idx && i<S.history.length;i++){
     const g=S.history[i];
     if([...(g.teamA||[]),...(g.teamB||[])].includes(pid)) n++;
@@ -2453,7 +2684,7 @@ function buildHistoryCopy(){
   box.textContent=S.history.slice().reverse().map(g=>{
     const t=new Date(g.startedAt).toLocaleTimeString('th-TH');
     const dur=g.endedAt?` (${formatDuration(g.startedAt,g.endedAt)})` : '';
-    return `${getCourtLabelById(g.court)} • ${t} — ${g.teamA.map(safeName).join(' & ')} vs ${g.teamB.map(safeName).join(' & ')}${dur}`;
+    return `${historyCourtLabel(g)} • ${t} — ${g.teamA.map(safeName).join(' & ')} vs ${g.teamB.map(safeName).join(' & ')}${dur}`;
   }).join('\n');
   // กล่องบนจอ: ตัวเลขรวมแต้มต่อคนมาสาย (ตรงกับที่ระบบใช้จัดคิว) + ป้าย (สาย) ท้ายบรรทัด
   const pbox=document.getElementById('playersCopy');
