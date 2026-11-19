@@ -1,5 +1,7 @@
 # Badminton Manager
 
+**เปิดใช้งาน: https://grandthing.github.io/badminton-manager/**
+
 เว็บแอปจัดคิวก๊วนแบดมินตัน — ไฟล์เดียว (`index.html`) เปิดในเบราว์เซอร์ได้เลย ไม่ต้องติดตั้งอะไร ข้อมูลเก็บในเบราว์เซอร์ของเครื่องที่ใช้ (localStorage)
 
 ## ใช้งาน
